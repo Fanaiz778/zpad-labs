@@ -216,3 +216,34 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# System files
+.DS_Store
+Thumbs.db
+
+# IDE settings
+.idea/
+.vscode/
+*.swp
+
+# C++ / CMake build files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.o
+*.out
+*.exe
+
+# Large or generated data files
+*.csv
+*.txt
+*.json
+*.xlsx
+*.zip
+*.tar.gz
+
+# Generated media files
+*.mp4
+*.avi
+*.mov
