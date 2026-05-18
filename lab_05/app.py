@@ -1,13 +1,16 @@
 from pathlib import Path
-from io import StringIO
 import re
 import urllib.request
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
 
+
+# -----------------------------
+# Налаштування
+# -----------------------------
 
 RAW_DATA_DIR = Path("data/raw/vhi")
 RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -76,19 +79,23 @@ UKRAINIAN_REGION_INDEX = {
 }
 
 
-def get_noaa_url(province_id: int, year_start: int = YEAR_START, year_end: int = YEAR_END) -> str:
+# -----------------------------
+# Завантаження та парсинг даних
+# -----------------------------
+
+def get_noaa_url(province_id: int) -> str:
     return (
         "https://www.star.nesdis.noaa.gov/smcd/emb/vci/VH/get_TS_admin.php?"
-        f"country=UKR&provinceID={province_id}&year1={year_start}&year2={year_end}&type=Mean"
+        f"country=UKR&provinceID={province_id}&year1={YEAR_START}&year2={YEAR_END}&type=Mean"
     )
 
 
 def download_vhi_file(province_id: int) -> Path:
-    existing_files = sorted(RAW_DATA_DIR.glob(f"province_{province_id:02d}.csv"))
-    if existing_files:
-        return existing_files[-1]
-
     file_path = RAW_DATA_DIR / f"province_{province_id:02d}.csv"
+
+    if file_path.exists():
+        return file_path
+
     url = get_noaa_url(province_id)
 
     with urllib.request.urlopen(url) as response:
@@ -99,30 +106,56 @@ def download_vhi_file(province_id: int) -> Path:
 
 
 def parse_vhi_file(file_path: Path, province_id: int) -> pd.DataFrame:
+    """
+    Надійний парсер NOAA-файлу.
+
+    Він не залежить від HTML-розмітки, а просто шукає в рядках
+    числові значення: year, week, SMN, SMT, VCI, TCI, VHI.
+    """
     raw_text = file_path.read_text(encoding="utf-8", errors="ignore")
-    clean_text = re.sub(r"<[^>]+>", "", raw_text)
-    lines = clean_text.splitlines()
 
-    data_lines = []
-    for line in lines:
-        line = line.strip()
-        if re.match(r"^\d{4}\s*,", line):
-            data_lines.append(line)
+    rows = []
+    for line in raw_text.splitlines():
+        # Прибираємо HTML-теги, якщо вони є
+        clean_line = re.sub(r"<[^>]+>", " ", line).strip()
 
-    if not data_lines:
-        raise ValueError(f"У файлі {file_path} не знайдено рядків з даними.")
+        # Шукаємо числа в рядку
+        numbers = re.findall(r"-?\d+(?:\.\d+)?", clean_line)
 
-    csv_text = "year,week,SMN,SMT,VCI,TCI,VHI\n" + "\n".join(data_lines)
-    df = pd.read_csv(StringIO(csv_text))
+        if len(numbers) < 7:
+            continue
 
-    for column in df.columns:
-        df[column] = pd.to_numeric(df[column], errors="coerce")
+        try:
+            year = int(float(numbers[0]))
+            week = int(float(numbers[1]))
+        except ValueError:
+            continue
 
+        # Беремо лише реальні рядки даних
+        if not (YEAR_START <= year <= YEAR_END and 1 <= week <= 52):
+            continue
+
+        try:
+            row = [
+                year,
+                week,
+                float(numbers[2]),
+                float(numbers[3]),
+                float(numbers[4]),
+                float(numbers[5]),
+                float(numbers[6]),
+            ]
+            rows.append(row)
+        except ValueError:
+            continue
+
+    if not rows:
+        raise ValueError(f"У файлі {file_path} не знайдено коректних рядків з даними.")
+
+    df = pd.DataFrame(rows, columns=["year", "week", "SMN", "SMT", "VCI", "TCI", "VHI"])
+
+    # Значення -1 часто означає пропуск
     df = df.replace(-1, np.nan)
-    df = df.dropna(subset=["year", "week"])
-
-    df["year"] = df["year"].astype(int)
-    df["week"] = df["week"].astype(int)
 
     ua_index, ua_name = UKRAINIAN_REGION_INDEX[province_id]
     df["province_noaa_id"] = province_id
@@ -139,21 +172,27 @@ def load_vhi_data() -> pd.DataFrame:
 
     for province_id in NOAA_PROVINCES:
         file_path = download_vhi_file(province_id)
-        frames.append(parse_vhi_file(file_path, province_id))
+        province_df = parse_vhi_file(file_path, province_id)
+        frames.append(province_df)
 
-    df = pd.concat(frames, ignore_index=True)
+    data = pd.concat(frames, ignore_index=True)
 
     numeric_columns = ["SMN", "SMT", "VCI", "TCI", "VHI"]
+
     for column in numeric_columns:
-        df[column] = df.groupby("province_ua_index")[column].transform(
+        data[column] = data.groupby("province_ua_index")[column].transform(
             lambda series: series.fillna(series.median())
         )
 
-    df = df.sort_values(["province_ua_index", "year", "week"]).reset_index(drop=True)
-    return df
+    data = data.sort_values(["province_ua_index", "year", "week"]).reset_index(drop=True)
+    return data
 
 
-def reset_filters():
+# -----------------------------
+# Фільтрація та графіки
+# -----------------------------
+
+def reset_filters() -> None:
     st.session_state["selected_index"] = "VCI"
     st.session_state["selected_region"] = "Вінницька"
     st.session_state["week_range"] = (1, 52)
@@ -162,8 +201,28 @@ def reset_filters():
     st.session_state["sort_descending"] = False
 
 
+def init_session_state() -> None:
+    if "selected_index" not in st.session_state:
+        st.session_state["selected_index"] = "VCI"
+
+    if "selected_region" not in st.session_state:
+        st.session_state["selected_region"] = "Вінницька"
+
+    if "week_range" not in st.session_state:
+        st.session_state["week_range"] = (1, 52)
+
+    if "year_range" not in st.session_state:
+        st.session_state["year_range"] = (YEAR_START, YEAR_END)
+
+    if "sort_ascending" not in st.session_state:
+        st.session_state["sort_ascending"] = False
+
+    if "sort_descending" not in st.session_state:
+        st.session_state["sort_descending"] = False
+
+
 def apply_filters(
-    df: pd.DataFrame,
+    data: pd.DataFrame,
     selected_index: str,
     selected_region: str,
     week_range: tuple[int, int],
@@ -171,10 +230,10 @@ def apply_filters(
     sort_ascending: bool,
     sort_descending: bool,
 ) -> pd.DataFrame:
-    filtered = df[
-        (df["province_ua_name"] == selected_region)
-        & (df["week"].between(week_range[0], week_range[1]))
-        & (df["year"].between(year_range[0], year_range[1]))
+    filtered = data[
+        (data["province_ua_name"] == selected_region)
+        & (data["week"].between(week_range[0], week_range[1]))
+        & (data["year"].between(year_range[0], year_range[1]))
     ].copy()
 
     if sort_ascending and not sort_descending:
@@ -195,40 +254,44 @@ def plot_filtered_data(filtered: pd.DataFrame, selected_index: str, selected_reg
         ax.set_axis_off()
         return fig
 
-    plot_df = filtered.sort_values(["year", "week"]).copy()
-    plot_df["period"] = plot_df["year"].astype(str) + "-W" + plot_df["week"].astype(str).str.zfill(2)
+    plot_data = filtered.sort_values(["year", "week"]).copy()
+    plot_data["period"] = (
+        plot_data["year"].astype(str)
+        + "-W"
+        + plot_data["week"].astype(str).str.zfill(2)
+    )
 
-    ax.plot(range(len(plot_df)), plot_df[selected_index], linewidth=1.5)
+    ax.plot(range(len(plot_data)), plot_data[selected_index], linewidth=1.5)
     ax.set_title(f"{selected_index} для області: {selected_region}")
     ax.set_xlabel("Період")
     ax.set_ylabel(selected_index)
     ax.grid(True, alpha=0.3)
 
-    if len(plot_df) > 20:
-        tick_positions = np.linspace(0, len(plot_df) - 1, 10, dtype=int)
+    if len(plot_data) > 20:
+        tick_positions = np.linspace(0, len(plot_data) - 1, 10, dtype=int)
     else:
-        tick_positions = np.arange(len(plot_df))
+        tick_positions = np.arange(len(plot_data))
 
     ax.set_xticks(tick_positions)
-    ax.set_xticklabels(plot_df.iloc[tick_positions]["period"], rotation=45, ha="right")
+    ax.set_xticklabels(plot_data.iloc[tick_positions]["period"], rotation=45, ha="right")
     fig.tight_layout()
     return fig
 
 
 def plot_region_comparison(
-    df: pd.DataFrame,
+    data: pd.DataFrame,
     selected_index: str,
     selected_region: str,
     week_range: tuple[int, int],
     year_range: tuple[int, int],
 ):
-    comparison_df = df[
-        (df["week"].between(week_range[0], week_range[1]))
-        & (df["year"].between(year_range[0], year_range[1]))
+    comparison_data = data[
+        (data["week"].between(week_range[0], week_range[1]))
+        & (data["year"].between(year_range[0], year_range[1]))
     ].copy()
 
     grouped = (
-        comparison_df.groupby("province_ua_name", as_index=False)[selected_index]
+        comparison_data.groupby("province_ua_name", as_index=False)[selected_index]
         .mean()
         .sort_values(selected_index, ascending=False)
     )
@@ -242,6 +305,7 @@ def plot_region_comparison(
 
     bars = ax.bar(grouped["province_ua_name"], grouped[selected_index])
 
+    # Обрану область виділяємо штрихуванням
     for bar, region in zip(bars, grouped["province_ua_name"]):
         if region == selected_region:
             bar.set_hatch("//")
@@ -256,6 +320,10 @@ def plot_region_comparison(
     return fig
 
 
+# -----------------------------
+# Streamlit UI
+# -----------------------------
+
 st.set_page_config(
     page_title="Лабораторна №5 — VCI/TCI/VHI Dashboard",
     layout="wide",
@@ -265,9 +333,7 @@ st.title("Лабораторна робота №5")
 st.subheader("Streamlit-додаток для аналізу VCI, TCI та VHI")
 
 vhi_df = load_vhi_data()
-
-if "selected_index" not in st.session_state:
-    reset_filters()
+init_session_state()
 
 regions = (
     vhi_df[["province_ua_index", "province_ua_name"]]
@@ -297,6 +363,7 @@ with left_column:
         "Інтервал тижнів",
         min_value=1,
         max_value=52,
+        value=st.session_state["week_range"],
         key="week_range",
     )
 
@@ -304,6 +371,7 @@ with left_column:
         "Інтервал років",
         min_value=int(vhi_df["year"].min()),
         max_value=int(vhi_df["year"].max()),
+        value=st.session_state["year_range"],
         key="year_range",
     )
 
@@ -330,7 +398,7 @@ with left_column:
     )
 
 filtered_df = apply_filters(
-    df=vhi_df,
+    data=vhi_df,
     selected_index=selected_index,
     selected_region=selected_region,
     week_range=week_range,
@@ -347,6 +415,7 @@ with right_column:
     with tab_table:
         st.subheader("Відфільтровані дані")
         st.write(f"Кількість записів: **{len(filtered_df)}**")
+
         st.dataframe(
             filtered_df[
                 [
@@ -370,10 +439,10 @@ with right_column:
     with tab_comparison:
         st.subheader(f"Порівняння {selected_index} між областями")
         fig_comparison = plot_region_comparison(
-            vhi_df,
-            selected_index,
-            selected_region,
-            week_range,
-            year_range,
+            data=vhi_df,
+            selected_index=selected_index,
+            selected_region=selected_region,
+            week_range=week_range,
+            year_range=year_range,
         )
         st.pyplot(fig_comparison)
